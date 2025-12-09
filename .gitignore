@@ -1,0 +1,83 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg
+*.egg-info/
+dist/
+build/
+*.whl
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Virtual Environments
+venv/
+env/
+ENV/
+.venv
+*.virtualenv
+
+# Jupyter Notebook
+.ipynb_checkpoints
+*.ipynb
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Model Checkpoints and Weights
+ckpts/
+*.pth
+*.pt
+*.ckpt
+*.safetensors
+*.bin
+*.h5
+*.pb
+*.onnx
+
+# Results and Outputs
+results_pt/
+results_tf/
+adversarial_images/
+outputs/
+logs/
+*.log
+
+# Datasets
+val2017/
+train2017/
+test2017/
+*.zip
+*.tar
+*.tar.gz
+
+# Credentials and API Keys
+.env
+.env.local
+*.key
+*.pem
+credentials.json
+config.ini
+
+# Cache and Temporary Files
+.cache/
+*.tmp
+*.temp
+temp/
+tmp/
+
+# OS
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+
+# Harmful corpus (sensitive data)
+harmful_corpus/
