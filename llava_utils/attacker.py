@@ -72,6 +72,10 @@ class Attacker:
             adv_noise.grad.zero_()
             self.model.zero_grad()
             
+            # Clear GPU cache periodically to prevent memory accumulation
+            if t % 10 == 0 and torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            
             self.loss_buffer.append(target_loss.item())
             
             # Debug: print gradient stats
