@@ -98,7 +98,7 @@ def main():
         adv_img = attacker.attack_constrained(
             text_prompt_template,
             img=img_tensor,
-            batch_size=2,
+            batch_size=1,
             num_iter=args.n_iters,
             alpha=args.alpha / 255,
             epsilon=args.eps / 255
