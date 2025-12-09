@@ -26,6 +26,10 @@ def parse_args():
                         help='Directory where adversarial images will be saved')
     parser.add_argument("--image_dir", type=str, default='adversarial_images',
                         help='Directory containing images to attack')
+    
+    parser.add_argument("--start_index", type=int, default=0, help="Index to start at")
+    parser.add_argument("--end_index", type=int, default=-1, help="Index to end at (-1 for all)")
+    
     args = parser.parse_args()
     return args
 
@@ -38,20 +42,16 @@ def main():
         
     print('>>> Initializing Models')
     
-    # Create a dummy args object for get_model
     class ModelArgs:
         def __init__(self, model_path, model_base, gpu_id):
             self.model_path = model_path
             self.model_base = model_base
             self.gpu_id = gpu_id
-            self.low_resource = False # Assuming this is needed
+            self.low_resource = False 
             
     model_args = ModelArgs(args.model_path, args.model_base, args.gpu_id)
     
-    # get_model returns: tokenizer, model, image_processor, model_name
     tokenizer, model, image_processor, model_name = get_model(model_args)
-    # print(f"DEBUG: Image Processor Mean: {image_processor.image_mean}")
-    # print(f"DEBUG: Image Processor Std: {image_processor.image_std}")
     model.eval()
     
     print('[Model Initialization Finished]')
@@ -68,33 +68,58 @@ def main():
 
     # Get all image files from the directory
     image_extensions = ['.jpg', '.jpeg', '.png', '.bmp', '.gif']
-    image_files = [f for f in os.listdir(args.image_dir)
-                   if os.path.splitext(f)[1].lower() in image_extensions]
+    
+    # IMPORTANT: Sorted ensures everyone gets the same order
+    image_files = sorted([f for f in os.listdir(args.image_dir)
+                   if os.path.splitext(f)[1].lower() in image_extensions])
 
     if not image_files:
         print(f'No images found in {args.image_dir}')
         return
 
-    print(f'Found {len(image_files)} images to attack')
+    # --- SLICING ---
+    total_images = len(image_files)
+    end_idx = args.end_index if args.end_index != -1 else total_images
+    # Ensure end_idx doesn't exceed bounds
+    end_idx = min(end_idx, total_images)
+    
+    # Slice the list for this specific user
+    my_batch = image_files[args.start_index : end_idx]
+    
+    print(f"Total Dataset Size: {total_images}")
+    print(f"Processing range: {args.start_index} to {end_idx}")
+    print(f"Images in this job: {len(my_batch)}")
+    # ---------------------
 
     # Prepare prompt
     text_prompt_template = prompt_wrapper.prepare_text_prompt('')
 
-    # Attack each image
-    for idx, img_file in enumerate(image_files):
+    # Attack each image in the assigned slice
+    for idx, img_file in enumerate(my_batch):
+        # Calculate true index for logging
+        true_idx = args.start_index + idx
         img_path = os.path.join(args.image_dir, img_file)
-        print(f'\n>>> [{idx+1}/{len(image_files)}] Processing {img_file}')
+        print(f'\n>>> [{true_idx+1}/{total_images}] Processing {img_file}')
+
+        # Check if output already exists (Resume capability)
+        base_name = os.path.splitext(img_file)[0]
+        save_path = f'{args.save_dir}/adv_{base_name}.bmp'
+        
+        if os.path.exists(save_path):
+             print(f"Skipping {img_file}, already exists.")
+             continue
 
         # Load image
-        image = Image.open(img_path).convert('RGB')
+        try:
+            image = Image.open(img_path).convert('RGB')
+        except Exception as e:
+            print(f"Error loading {img_file}: {e}")
+            continue
 
         # Preprocess image
         img_tensor = image_processor.preprocess(image, return_tensors='pt')['pixel_values'].to(device)
 
-        print(f'Image tensor shape: {img_tensor.shape}')
-
-        print('>>> Starting Attack')
-
+        # Attack
         adv_img = attacker.attack_constrained(
             text_prompt_template,
             img=img_tensor,
@@ -104,13 +129,11 @@ def main():
             epsilon=args.eps / 255
         )
 
-        # Save adversarial image with original filename
-        base_name = os.path.splitext(img_file)[0]
-        save_path = f'{args.save_dir}/adv_{base_name}.bmp'
+        # Save
         save_image(adv_img, save_path)
         print(f'Saved adversarial image to {save_path}')
 
-    print(f'\n>>> Attack finished. Processed {len(image_files)} images.')
+    print(f'\n>>> Attack finished.')
 
 if __name__ == '__main__':
     main()
