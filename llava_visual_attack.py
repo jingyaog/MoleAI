@@ -8,7 +8,7 @@ from PIL import Image
 from torchvision.utils import save_image
 
 # Add the other repo to path to import model utils
-sys.path.append('/users/jgong42/csci1470/Visual-Adversarial-Examples-Jailbreak-Large-Language-Models')
+sys.path.append('/users/cvutha/Desktop/MoleAI/Visual-Adversarial-Examples-Jailbreak-Large-Language-Models')
 
 from llava_llama_2.utils import get_model
 from llava_llama_2_utils import prompt_wrapper
@@ -16,7 +16,7 @@ from llava_utils.attacker import Attacker
 
 def parse_args():
     parser = argparse.ArgumentParser(description="LLaVA Visual Attack")
-    parser.add_argument("--model-path", type=str, default="ckpts/llava_llama_2_13b_chat_freeze")
+    parser.add_argument("--model-path", type=str, default="/users/cvutha/scratch/MoleAI_ckpts/llava-llama-2-13b-chat-lightning-preview")
     parser.add_argument("--model-base", type=str, default=None)
     parser.add_argument("--gpu_id", type=int, default=0)
     parser.add_argument("--n_iters", type=int, default=2000)
@@ -26,6 +26,10 @@ def parse_args():
                         help='Directory where adversarial images will be saved')
     parser.add_argument("--image_dir", type=str, default='adversarial_images',
                         help='Directory containing images to attack')
+    parser.add_argument("--load_8bit", action='store_true',
+                        help='Load model in 8-bit mode to reduce GPU memory usage')
+    parser.add_argument("--load_4bit", action='store_true',
+                        help='Load model in 4-bit mode to reduce GPU memory usage (uses less memory than 8-bit)')
     
     parser.add_argument("--start_index", type=int, default=0, help="Index to start at")
     parser.add_argument("--end_index", type=int, default=-1, help="Index to end at (-1 for all)")
@@ -43,21 +47,36 @@ def main():
     print('>>> Initializing Models')
     
     class ModelArgs:
-        def __init__(self, model_path, model_base, gpu_id):
+        def __init__(self, model_path, model_base, gpu_id, load_8bit=False, load_4bit=False):
             self.model_path = model_path
             self.model_base = model_base
             self.gpu_id = gpu_id
-            self.low_resource = False 
+            self.low_resource = False
+            self.load_8bit = load_8bit
+            self.load_4bit = load_4bit
             
-    model_args = ModelArgs(args.model_path, args.model_base, args.gpu_id)
+    model_args = ModelArgs(args.model_path, args.model_base, args.gpu_id, args.load_8bit, args.load_4bit)
+    
+    # Clear GPU cache before loading model
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
     
     tokenizer, model, image_processor, model_name = get_model(model_args)
     model.eval()
     
+    # Clear GPU cache again after loading
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    
     print('[Model Initialization Finished]')
     
     print('>>> Loading harmful corpus')
-    with open("harmful_corpus/derogatory_corpus.csv", "r") as f:
+    # Path to harmful corpus in the Visual-Adversarial-Examples repository
+    corpus_path = os.path.join(
+        '/users/cvutha/Desktop/MoleAI/Visual-Adversarial-Examples-Jailbreak-Large-Language-Models',
+        'harmful_corpus', 'derogatory_corpus.csv'
+    )
+    with open(corpus_path, "r") as f:
         data = list(csv.reader(f, delimiter=","))
     
     targets = [row[0] for row in data]
@@ -119,15 +138,23 @@ def main():
         # Preprocess image
         img_tensor = image_processor.preprocess(image, return_tensors='pt')['pixel_values'].to(device)
 
-        # Attack
+        # Clear GPU cache before attack to free up memory
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        
+        # Attack with reduced batch_size to save memory
         adv_img = attacker.attack_constrained(
             text_prompt_template,
             img=img_tensor,
-            batch_size=2,
+            batch_size=1,  # Reduced from 2 to 1 to save GPU memory
             num_iter=args.n_iters,
             alpha=args.alpha / 255,
             epsilon=args.eps / 255
         )
+        
+        # Clear GPU cache after attack
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
         # Save
         save_image(adv_img, save_path)
