@@ -87,5 +87,5 @@ Thumbs.db
 harmful_corpus/
 
 # External repositories (should be cloned separately)
-Visual-Adversarial-Examples-Jailbreak-Large-Language-Models/
+Visual-Adversarial-Examples-Jailbreak-Large-Language-Models/*
 !Visual-Adversarial-Examples-Jailbreak-Large-Language-Models/minigpt4/
