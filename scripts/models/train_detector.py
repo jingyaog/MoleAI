@@ -9,12 +9,10 @@ from PIL import Image
 import open_clip
 from tqdm import tqdm
 
-# --- THE ARCHITECTURE ---
 class JailbreakDetector(nn.Module):
     def __init__(self, model_name="RN50", pretrained="openai"):
         super().__init__()
         print(f">>> Loading Backbone: {model_name} (pretrained: {pretrained})")
-        # Load the Pre-trained CLIP ResNet model
         self.encoder, _, _ = open_clip.create_model_and_transforms(model_name, pretrained=pretrained)
 
         # Freeze the encoder (We only train the head)
@@ -22,8 +20,6 @@ class JailbreakDetector(nn.Module):
             param.requires_grad = False
 
         # The Classification Head
-        # We use a simple MLP. Input is 1024 (CLIP RN50 embedding size).
-        # We do NOT use Sigmoid here. We output raw logits for stability.
         self.classifier = nn.Sequential(
             nn.Linear(1024, 256),
             nn.ReLU(),
@@ -32,18 +28,17 @@ class JailbreakDetector(nn.Module):
         )
 
     def forward(self, images):
-        # 1. Pass image through frozen CLIP encoder
+        # Pass image through frozen CLIP encoder
         with torch.no_grad():
             features = self.encoder.encode_image(images)
 
-        # 2. Normalize features (CLIP outputs are typically normalized)
+        # Normalize features (CLIP outputs are typically normalized)
         features = features.float()
 
-        # 3. Pass through classifier
+        # Pass through classifier
         logits = self.classifier(features)
         return logits
 
-# --- DATASET ---
 class PairedDataset(Dataset):
     def __init__(self, clean_dir, adv_dir, preprocess):
         # Check if directories exist
@@ -86,7 +81,7 @@ class PairedDataset(Dataset):
         path, label = self.data[idx]
         try:
             image = Image.open(path).convert("RGB")
-            # Preprocess (Resize/Normalize) using OpenCLIP preprocessing
+            # Preprocess
             image_tensor = self.preprocess(image)
             return {
                 "pixel_values": image_tensor,
@@ -97,7 +92,6 @@ class PairedDataset(Dataset):
             print(f"Error loading {path}: {e}")
             return self.__getitem__((idx + 1) % len(self.data))
 
-# --- TRAINING LOOP ---
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--clean_dir", required=True)
@@ -138,7 +132,6 @@ def main():
     
     # Optimizer & Loss
     optimizer = optim.Adam(model.classifier.parameters(), lr=1e-3)
-    # BCEWithLogitsLoss includes the Sigmoid + BCELoss in one stable function
     criterion = nn.BCEWithLogitsLoss()
 
     print(">>> Starting Training...")
