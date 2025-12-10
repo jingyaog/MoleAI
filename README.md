@@ -355,4 +355,4 @@ This project is released for academic research purposes. See individual model li
 
 ---
 
-**Last Updated**: December 2024
+**Last Updated**: December 2025
