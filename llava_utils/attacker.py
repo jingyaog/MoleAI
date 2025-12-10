@@ -1,177 +1,336 @@
-import torch
+import tensorflow as tf
 from tqdm import tqdm
 import random
-from torchvision.utils import save_image
 import seaborn as sns
 import matplotlib.pyplot as plt
 import os
 import numpy as np
+from PIL import Image
 
-# We assume sys.path is set up correctly in the main script to import these
+# Import wrapper from llava utilities
 from llava_llama_2_utils import prompt_wrapper
 
-def normalize(images):
-    mean = torch.tensor([0.48145466, 0.4578275, 0.40821073]).cuda()
-    std = torch.tensor([0.26862954, 0.26130258, 0.27577711]).cuda()
-    images = images - mean[None, :, None, None]
-    images = images / std[None, :, None, None]
-    return images
+# Statistical parameters for image preprocessing
+NORMALIZATION_MEAN = tf.constant([0.48145466, 0.4578275, 0.40821073], dtype=tf.float32)
+NORMALIZATION_STD = tf.constant([0.26862954, 0.26130258, 0.27577711], dtype=tf.float32)
 
-def denormalize(images):
-    mean = torch.tensor([0.48145466, 0.4578275, 0.40821073]).cuda()
-    std = torch.tensor([0.26862954, 0.26130258, 0.27577711]).cuda()
-    images = images * std[None, :, None, None]
-    images = images + mean[None, :, None, None]
-    return images
 
-class Attacker:
-    def __init__(self, args, model, tokenizer, targets, device='cuda:0', is_rtp=False):
-        self.args = args
-        self.model = model
-        self.tokenizer = tokenizer
-        self.device = device
-        self.is_rtp = is_rtp
-        self.targets = targets
-        self.num_targets = len(targets)
-        self.loss_buffer = []
-        
-        # Freeze model
-        self.model.eval()
-        self.model.requires_grad_(False)
+class ImagePreprocessor:
+    """Handles image normalization and denormalization operations."""
 
-    def attack_constrained(self, text_prompt, img, batch_size=8, num_iter=2000, alpha=1/255, epsilon=128/255):
-        print('>>> batch_size:', batch_size)
-        
-        # img is expected to be [1, 3, H, W] and normalized? 
-        # In original code, it seems `img` passed to this function is NOT normalized if it calls `denormalize(img)` immediately?
-        # Wait, `x = denormalize(img)`. If `img` was not normalized, `denormalize` would make it huge.
-        # So `img` MUST be normalized.
-        
-        adv_noise = torch.rand_like(img).to(self.device) * 2 * epsilon - epsilon
-        x = denormalize(img).clone().to(self.device)
-        adv_noise.data = (adv_noise.data + x.data).clamp(0, 1) - x.data
-        
-        adv_noise.requires_grad_(True)
-        adv_noise.retain_grad()
-        
-        # Correct Prompt initialization
-        prompt = prompt_wrapper.Prompt(self.model, self.tokenizer, text_prompts=text_prompt, device=self.device)
-        
-        for t in tqdm(range(num_iter + 1)):
-            batch_targets = random.sample(self.targets, batch_size)
-            
-            x_adv = x + adv_noise
-            x_adv = normalize(x_adv)
-            
-            # Pass x_adv to attack_loss
-            target_loss = self.attack_loss(prompt, x_adv, batch_targets)
-            target_loss.backward()
-            
-            adv_noise.data = (adv_noise.data - alpha * adv_noise.grad.detach().sign()).clamp(-epsilon, epsilon)
-            adv_noise.data = (adv_noise.data + x.data).clamp(0, 1) - x.data
-            adv_noise.grad.zero_()
-            self.model.zero_grad()
-            
-            # Clear GPU cache periodically to prevent memory accumulation
-            if t % 10 == 0 and torch.cuda.is_available():
-                torch.cuda.empty_cache()
-            
-            self.loss_buffer.append(target_loss.item())
-            
-            # Debug: print gradient stats
-            if t % 1 == 0:
-                grad_norm = adv_noise.grad.norm().item()
-                print(f"Iter {t}, Loss: {target_loss.item()}, Grad Norm: {grad_norm}")
-                if torch.isnan(adv_noise.grad).any():
-                    print("NAN IN GRADIENT!")
-                self.plot_loss()
-                
-            if t % 100 == 0:
-                print(f'######### Output - Iter = {t} ##########')
-                x_adv = x + adv_noise
-                x_adv = normalize(x_adv)
-                
-                adv_img_prompt = denormalize(x_adv).detach().cpu()
-                adv_img_prompt = adv_img_prompt.squeeze(0)
-                save_image(adv_img_prompt, '%s/bad_prompt_temp_%d.bmp' % (self.args.save_dir, t))
-                
-        return denormalize(x_adv).detach().cpu()
+    @staticmethod
+    def apply_normalization(image_tensor):
+        """Apply standardization using predefined mean and std."""
+        mean_reshaped = tf.reshape(NORMALIZATION_MEAN, [1, 1, 1, 3])
+        std_reshaped = tf.reshape(NORMALIZATION_STD, [1, 1, 1, 3])
+        standardized = tf.subtract(image_tensor, mean_reshaped)
+        standardized = tf.divide(standardized, std_reshaped)
+        return standardized
 
-    def plot_loss(self):
-        sns.set_theme()
-        num_iters = len(self.loss_buffer)
-        x_ticks = list(range(0, num_iters))
-        plt.plot(x_ticks, self.loss_buffer, label='Target Loss')
-        plt.title('Loss Plot')
-        plt.xlabel('Iters')
-        plt.ylabel('Loss')
-        plt.legend(loc='best')
-        plt.savefig('%s/loss_curve.png' % (self.args.save_dir))
-        plt.clf()
+    @staticmethod
+    def reverse_normalization(image_tensor):
+        """Reverse the standardization process."""
+        mean_reshaped = tf.reshape(NORMALIZATION_MEAN, [1, 1, 1, 3])
+        std_reshaped = tf.reshape(NORMALIZATION_STD, [1, 1, 1, 3])
+        denorm = tf.multiply(image_tensor, std_reshaped)
+        denorm = tf.add(denorm, mean_reshaped)
+        return denorm
 
-    def attack_loss(self, prompts, images, targets):
-        # Copied from llava_llama_2_utils/visual_attacker.py
-        
-        context_length = prompts.context_length
-        context_input_ids = prompts.input_ids
-        batch_size = len(targets)
-        
-        if len(context_input_ids) == 1:
-            context_length = context_length * batch_size
-            context_input_ids = context_input_ids * batch_size
-            
-        # Repeat images for batch
-        images = images.repeat(batch_size, 1, 1, 1)
-        
-        assert len(context_input_ids) == len(targets), f"Unmatched batch size {len(context_input_ids)} != {len(targets)}"
-        
-        # Tokenize targets
-        # Note: self.tokenizer(targets) returns a BatchEncoding. 
-        # We need to handle the BOS token.
-        input_ids_list = self.tokenizer(targets).input_ids
-        # Debug: print first target and its tokens
-        if len(self.loss_buffer) == 0: # Only print once
-            print(f"DEBUG: Target 0: {targets[0]}")
-            print(f"DEBUG: Tokens 0: {input_ids_list[0]}")
-            print(f"DEBUG: Sliced 0: {input_ids_list[0][1:]}")
-        
-        to_regress_tokens = [torch.as_tensor([item[1:]]).to(self.device) for item in input_ids_list]
-        
-        seq_tokens_length = []
-        labels = []
-        input_ids = []
-        
-        for i, item in enumerate(to_regress_tokens):
-            L = item.shape[1] + context_length[i]
-            seq_tokens_length.append(L)
-            
-            context_mask = torch.full([1, context_length[i]], -100, dtype=to_regress_tokens[0].dtype, device=self.device)
-            labels.append(torch.cat([context_mask, item], dim=1))
-            input_ids.append(torch.cat([context_input_ids[i], item], dim=1))
-            
-        pad = torch.full([1, 1], 0, dtype=to_regress_tokens[0].dtype, device=self.device)
-        
-        max_length = max(seq_tokens_length)
-        attention_mask = []
-        
-        for i in range(batch_size):
-            num_to_pad = max_length - seq_tokens_length[i]
-            
-            padding_mask = torch.full([1, num_to_pad], -100, dtype=torch.long, device=self.device)
-            labels[i] = torch.cat([labels[i], padding_mask], dim=1)
-            
-            input_ids[i] = torch.cat([input_ids[i], pad.repeat(1, num_to_pad)], dim=1)
-            attention_mask.append(torch.LongTensor([[1] * seq_tokens_length[i] + [0] * num_to_pad]).to(self.device))
-            
-        labels = torch.cat(labels, dim=0).to(self.device)
-        input_ids = torch.cat(input_ids, dim=0).to(self.device)
-        attention_mask = torch.cat(attention_mask, dim=0).to(self.device)
-        
-        outputs = self.model(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            return_dict=True,
-            labels=labels,
-            images=images.half(),
+
+class AdversarialImageGenerator:
+    """
+    Generates adversarial perturbations for vision-language models.
+    Implements PGD-style attacks with configurable constraints.
+    """
+
+    def __init__(self, configuration, neural_model, text_tokenizer,
+                 target_strings, compute_device='cuda:0', rtp_mode=False):
+        """
+        Initialize the adversarial generator.
+
+        Args:
+            configuration: Attack configuration parameters
+            neural_model: The target vision-language model
+            text_tokenizer: Tokenizer for text processing
+            target_strings: List of target outputs to optimize for
+            compute_device: Device specification (kept for compatibility)
+            rtp_mode: Red team prompt mode flag
+        """
+        self.config = configuration
+        self.vl_model = neural_model
+        self.text_processor = text_tokenizer
+        self.hardware_device = compute_device
+        self.red_team_mode = rtp_mode
+        self.target_outputs = target_strings
+        self.num_objectives = len(target_strings)
+        self.loss_history = []
+        self.preprocessor = ImagePreprocessor()
+
+    def generate_adversarial_example(self, input_text, clean_image,
+                                     samples_per_batch=8, max_iterations=2000,
+                                     step_magnitude=1/255, perturbation_bound=128/255):
+        """
+        Create adversarial perturbation using projected gradient descent.
+
+        Args:
+            input_text: Text prompt for the model
+            clean_image: Original input image (normalized)
+            samples_per_batch: Number of target samples per iteration
+            max_iterations: Total optimization steps
+            step_magnitude: Step size for gradient updates
+            perturbation_bound: Maximum allowed perturbation magnitude
+
+        Returns:
+            Adversarial image (denormalized)
+        """
+        print(f'>>> Processing with batch size: {samples_per_batch}')
+
+        # Convert to TensorFlow tensors and setup
+        clean_img_tf = tf.constant(clean_image.numpy() if hasattr(clean_image, 'numpy') else clean_image)
+        base_image = self.preprocessor.reverse_normalization(clean_img_tf)
+
+        # Initialize perturbation randomly within bounds
+        perturbation_shape = base_image.shape
+        random_init = tf.random.uniform(perturbation_shape,
+                                       minval=-perturbation_bound,
+                                       maxval=perturbation_bound,
+                                       dtype=tf.float32)
+
+        # Ensure initial perturbation keeps image in valid range
+        delta = tf.Variable(random_init, trainable=True)
+        delta.assign(tf.clip_by_value(delta + base_image, 0.0, 1.0) - base_image)
+
+        # Setup prompt wrapper for model
+        prompt_handler = prompt_wrapper.Prompt(
+            self.vl_model,
+            self.text_processor,
+            text_prompts=input_text,
+            device=self.hardware_device
         )
-        return outputs.loss
+
+        # Optimization loop
+        for iteration_idx in tqdm(range(max_iterations + 1)):
+            # Sample random targets for this iteration
+            current_targets = random.sample(self.target_outputs, samples_per_batch)
+
+            # Compute adversarial image
+            perturbed_img = base_image + delta
+            normalized_adv = self.preprocessor.apply_normalization(perturbed_img)
+
+            # Compute loss and gradients using GradientTape
+            with tf.GradientTape() as tape:
+                tape.watch(delta)
+                objective_loss = self._compute_objective_loss(
+                    prompt_handler,
+                    normalized_adv,
+                    current_targets
+                )
+
+            # Get gradients with respect to perturbation
+            grad_delta = tape.gradient(objective_loss, delta)
+
+            # Update perturbation using signed gradient
+            gradient_direction = tf.sign(grad_delta)
+            delta_update = delta - step_magnitude * gradient_direction
+
+            # Project to perturbation ball
+            delta_clipped = tf.clip_by_value(delta_update, -perturbation_bound, perturbation_bound)
+
+            # Project to valid image range
+            delta_valid = tf.clip_by_value(delta_clipped + base_image, 0.0, 1.0) - base_image
+            delta.assign(delta_valid)
+
+            # Record loss for tracking
+            self.loss_history.append(float(objective_loss.numpy()))
+
+            # Periodic logging and visualization
+            if iteration_idx % 1 == 0:
+                gradient_magnitude = tf.norm(grad_delta).numpy()
+                print(f"Step {iteration_idx}, Objective: {float(objective_loss.numpy())}, "
+                      f"Gradient Magnitude: {gradient_magnitude}")
+
+                if tf.reduce_any(tf.math.is_nan(grad_delta)):
+                    print("WARNING: NaN detected in gradient!")
+
+                self._visualize_loss_curve()
+
+            # Save intermediate results
+            if iteration_idx % 100 == 0:
+                print(f'========= Checkpoint at iteration {iteration_idx} =========')
+                checkpoint_img = base_image + delta
+                checkpoint_normalized = self.preprocessor.apply_normalization(checkpoint_img)
+                checkpoint_denorm = self.preprocessor.reverse_normalization(checkpoint_normalized)
+
+                # Save to file
+                self._save_adversarial_image(
+                    checkpoint_denorm,
+                    f'{self.config.save_dir}/adversarial_checkpoint_{iteration_idx}.bmp'
+                )
+
+        # Return final adversarial example
+        final_adversarial = base_image + delta
+        final_normalized = self.preprocessor.apply_normalization(final_adversarial)
+        final_output = self.preprocessor.reverse_normalization(final_normalized)
+
+        return final_output.numpy()
+
+    def _visualize_loss_curve(self):
+        """Generate and save loss curve visualization."""
+        sns.set_theme()
+        iteration_count = len(self.loss_history)
+        x_axis = list(range(iteration_count))
+
+        plt.figure(figsize=(10, 6))
+        plt.plot(x_axis, self.loss_history, linewidth=2, color='crimson', label='Objective Loss')
+        plt.title('Adversarial Optimization Progress', fontsize=14, fontweight='bold')
+        plt.xlabel('Iteration Number', fontsize=12)
+        plt.ylabel('Loss Value', fontsize=12)
+        plt.legend(loc='upper right')
+        plt.grid(True, alpha=0.3)
+        plt.tight_layout()
+        plt.savefig(f'{self.config.save_dir}/optimization_curve.png', dpi=150)
+        plt.close()
+
+    def _save_adversarial_image(self, image_tensor, output_path):
+        """Save tensor as image file."""
+        img_np = image_tensor.numpy()
+        if img_np.ndim == 4:  # Batch dimension
+            img_np = img_np[0]
+
+        # Convert from [H, W, C] to [C, H, W] if needed, then transpose back
+        # Actually TensorFlow uses [H, W, C] by default, so just clip and convert
+        img_np = np.clip(img_np * 255, 0, 255).astype(np.uint8)
+
+        # Save using PIL
+        img_pil = Image.fromarray(img_np)
+        img_pil.save(output_path)
+
+    def _compute_objective_loss(self, prompt_object, adversarial_images, target_list):
+        """
+        Compute the attack loss by forcing model to generate target outputs.
+
+        Args:
+            prompt_object: Prompt wrapper with context
+            adversarial_images: Perturbed images
+            target_list: List of target strings to optimize for
+
+        Returns:
+            Scalar loss value
+        """
+        context_len = prompt_object.context_length
+        context_ids = prompt_object.input_ids
+        batch_count = len(target_list)
+
+        # Replicate context for batch if needed
+        if len(context_ids) == 1:
+            context_len = context_len * batch_count
+            context_ids = context_ids * batch_count
+
+        # Replicate images across batch
+        # TensorFlow uses different convention - need to handle tensor format
+        if isinstance(adversarial_images, tf.Tensor):
+            images_batched = tf.tile(adversarial_images, [batch_count, 1, 1, 1])
+        else:
+            import torch
+            images_batched = adversarial_images.repeat(batch_count, 1, 1, 1)
+
+        assert len(context_ids) == len(target_list), \
+            f"Batch size mismatch: {len(context_ids)} vs {len(target_list)}"
+
+        # Tokenize target strings
+        tokenized_targets = self.text_processor(target_list).input_ids
+
+        # Debug output on first call
+        if len(self.loss_history) == 0:
+            print(f"DEBUG: First target text: {target_list[0]}")
+            print(f"DEBUG: First target tokens: {tokenized_targets[0]}")
+            print(f"DEBUG: Tokens after BOS removal: {tokenized_targets[0][1:]}")
+
+        # Prepare regression tokens (remove BOS token)
+        import torch  # Still need torch for model input
+        regression_tokens = [
+            torch.as_tensor([tokens[1:]]).to(self.hardware_device)
+            for tokens in tokenized_targets
+        ]
+
+        # Build input sequences and labels
+        sequence_lengths = []
+        label_sequences = []
+        input_id_sequences = []
+
+        for idx, reg_token in enumerate(regression_tokens):
+            total_length = reg_token.shape[1] + context_len[idx]
+            sequence_lengths.append(total_length)
+
+            # Create context mask (-100 means ignore in loss)
+            ignore_mask = torch.full(
+                [1, context_len[idx]],
+                -100,
+                dtype=regression_tokens[0].dtype,
+                device=self.hardware_device
+            )
+
+            # Concatenate context mask with target tokens
+            label_sequences.append(torch.cat([ignore_mask, reg_token], dim=1))
+            input_id_sequences.append(torch.cat([context_ids[idx], reg_token], dim=1))
+
+        # Padding token
+        pad_token = torch.full([1, 1], 0, dtype=regression_tokens[0].dtype,
+                              device=self.hardware_device)
+
+        # Pad to maximum length
+        max_seq_len = max(sequence_lengths)
+        attention_masks = []
+
+        for idx in range(batch_count):
+            padding_needed = max_seq_len - sequence_lengths[idx]
+
+            # Pad labels with ignore index
+            ignore_padding = torch.full([1, padding_needed], -100,
+                                       dtype=torch.long, device=self.hardware_device)
+            label_sequences[idx] = torch.cat([label_sequences[idx], ignore_padding], dim=1)
+
+            # Pad input ids
+            input_id_sequences[idx] = torch.cat(
+                [input_id_sequences[idx], pad_token.repeat(1, padding_needed)],
+                dim=1
+            )
+
+            # Create attention mask (1 for real tokens, 0 for padding)
+            mask_vector = [1] * sequence_lengths[idx] + [0] * padding_needed
+            attention_masks.append(
+                torch.LongTensor([mask_vector]).to(self.hardware_device)
+            )
+
+        # Concatenate all sequences
+        labels_batch = torch.cat(label_sequences, dim=0).to(self.hardware_device)
+        input_ids_batch = torch.cat(input_id_sequences, dim=0).to(self.hardware_device)
+        attention_mask_batch = torch.cat(attention_masks, dim=0).to(self.hardware_device)
+
+        # Convert TensorFlow tensor to PyTorch for model input if needed
+        if isinstance(images_batched, tf.Tensor):
+            images_np = images_batched.numpy()
+            import torch
+            images_batched = torch.from_numpy(images_np).to(self.hardware_device)
+
+        # Forward pass through model
+        model_outputs = self.vl_model(
+            input_ids=input_ids_batch,
+            attention_mask=attention_mask_batch,
+            return_dict=True,
+            labels=labels_batch,
+            images=images_batched.half(),
+        )
+
+        # Convert loss to TensorFlow tensor
+        loss_value = model_outputs.loss
+        if hasattr(loss_value, 'detach'):
+            loss_tf = tf.constant(loss_value.detach().cpu().numpy())
+        else:
+            loss_tf = tf.constant(float(loss_value))
+
+        return loss_tf
+
+
+# Maintain backward compatibility with original class name
+Attacker = AdversarialImageGenerator
