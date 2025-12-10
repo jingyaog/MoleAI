@@ -10,7 +10,6 @@ from PIL import Image
 from torchvision import models, transforms
 from tqdm import tqdm
 
-# --- THE ARCHITECTURE ---
 class JailbreakDetectorCNN(nn.Module):
     def __init__(self, backbone="resnet18", pretrained=True):
         super().__init__()
@@ -49,8 +48,6 @@ class JailbreakDetectorCNN(nn.Module):
             param.requires_grad = False
 
         # The Classification Head
-        # We use a simple MLP. Input depends on the backbone.
-        # We do NOT use Sigmoid here. We output raw logits for stability.
         self.classifier = nn.Sequential(
             nn.Flatten(),
             nn.Linear(feature_dim, 256),
@@ -72,7 +69,6 @@ class JailbreakDetectorCNN(nn.Module):
         logits = self.classifier(features)
         return logits
 
-# --- DATASET ---
 class PairedDataset(Dataset):
     def __init__(self, clean_dir, adv_dir, transform):
         # Check if directories exist
@@ -115,7 +111,7 @@ class PairedDataset(Dataset):
         path, label = self.data[idx]
         try:
             image = Image.open(path).convert("RGB")
-            # Apply transforms (Resize/Normalize) using torchvision
+            # Apply transforms
             image_tensor = self.transform(image)
             return {
                 "pixel_values": image_tensor,
@@ -141,7 +137,6 @@ def main():
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f">>> Device: {device}")
 
-    # ImageNet normalization (standard for pretrained models)
     transform = transforms.Compose([
         transforms.Resize(224),
         transforms.CenterCrop(224),
@@ -174,7 +169,6 @@ def main():
 
     # Optimizer & Loss
     optimizer = optim.Adam(model.classifier.parameters(), lr=1e-3)
-    # BCEWithLogitsLoss includes the Sigmoid + BCELoss in one stable function
     criterion = nn.BCEWithLogitsLoss()
 
     print(">>> Starting Training...")
@@ -205,7 +199,6 @@ def main():
 
             train_loss += loss.item()
 
-            # Accuracy Calculation (Sigmoid > 0.5 is equivalent to Logits > 0)
             preds = (logits > 0).float()
             correct += (preds == labels).sum().item()
             total += labels.size(0)
