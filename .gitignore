@@ -53,6 +53,7 @@ logs/
 # Datasets
 val2017/
 val2017_adv/
+val2017_resized/
 train2017/
 test2017/
 clean_1st_1667/

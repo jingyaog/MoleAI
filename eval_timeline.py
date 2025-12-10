@@ -5,9 +5,9 @@ import torch
 import re
 import pandas as pd
 from PIL import Image
-from transformers import CLIPVisionModel, CLIPImageProcessor
+from torchvision import transforms
 # Import the architecture from your training script
-from train_detector import JailbreakDetector
+from train_detector_cnn import JailbreakDetectorCNN
 
 def get_iteration(filename):
     """Extracts the iteration number from 'bad_prompt_temp_1200.bmp'"""
@@ -18,9 +18,12 @@ def get_iteration(filename):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model_path", default="jailbreak_detector.pth", help="Path to saved model")
+    parser.add_argument("--model_path", default="jailbreak_detector_resnet18.pth", help="Path to saved model")
     parser.add_argument("--image_dir", default="experiment_results", help="Folder containing attack history")
     parser.add_argument("--output_csv", default="attack_timeline.csv", help="Where to save results")
+    parser.add_argument("--backbone", type=str, default="resnet18",
+                        choices=["resnet18", "resnet34", "resnet50", "mobilenet_v2", "efficientnet_b0"],
+                        help="CNN backbone architecture (must match the trained model)")
     args = parser.parse_args()
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -28,9 +31,9 @@ def main():
 
     # 1. Load Model
     print(">>> Loading Detector...")
-    # Use the same base model name you used in training!
-    model = JailbreakDetector(base_model_name="openai/clip-vit-base-patch32").to(device)
-    
+    # Use the same backbone you used in training!
+    model = JailbreakDetectorCNN(backbone=args.backbone).to(device)
+
     if os.path.exists(args.model_path):
         model.load_state_dict(torch.load(args.model_path, map_location=device))
         model.eval()
@@ -39,8 +42,14 @@ def main():
         print(f"ERROR: Model file {args.model_path} not found! Train it first.")
         return
 
-    # 2. Load Processor
-    processor = CLIPImageProcessor.from_pretrained("openai/clip-vit-base-patch32")
+    # 2. Load Preprocessing Transforms
+    # ImageNet normalization (standard for pretrained models)
+    transform = transforms.Compose([
+        transforms.Resize(224),
+        transforms.CenterCrop(224),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+    ])
 
     # 3. Find Images
     # We look for the temp files generated during the attack
@@ -67,11 +76,10 @@ def main():
             try:
                 # Load Image
                 image = Image.open(path).convert("RGB")
-                inputs = processor(images=image, return_tensors="pt")
-                pixel_values = inputs["pixel_values"].to(device)
+                image_tensor = transform(image).unsqueeze(0).to(device)
 
                 # Inference
-                logits = model(pixel_values)
+                logits = model(image_tensor)
                 prob = torch.sigmoid(logits).item() # Probability of being Adversarial
                 
                 # Metadata

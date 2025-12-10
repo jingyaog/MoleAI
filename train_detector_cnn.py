@@ -1,43 +1,72 @@
 import argparse
 import os
 import glob
+import json
 import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader, random_split
 from PIL import Image
-import open_clip
+from torchvision import models, transforms
 from tqdm import tqdm
 
 # --- THE ARCHITECTURE ---
-class JailbreakDetector(nn.Module):
-    def __init__(self, model_name="RN50", pretrained="openai"):
+class JailbreakDetectorCNN(nn.Module):
+    def __init__(self, backbone="resnet18", pretrained=True):
         super().__init__()
-        print(f">>> Loading Backbone: {model_name} (pretrained: {pretrained})")
-        # Load the Pre-trained CLIP ResNet model
-        self.encoder, _, _ = open_clip.create_model_and_transforms(model_name, pretrained=pretrained)
+        print(f">>> Loading Backbone: {backbone} (pretrained: {pretrained})")
+
+        # Load the Pre-trained CNN backbone
+        weights = "DEFAULT" if pretrained else None
+        if backbone == "resnet18":
+            self.encoder = models.resnet18(weights=weights)
+            feature_dim = 512
+        elif backbone == "resnet50":
+            self.encoder = models.resnet50(weights=weights)
+            feature_dim = 2048
+        elif backbone == "resnet34":
+            self.encoder = models.resnet34(weights=weights)
+            feature_dim = 512
+        elif backbone == "mobilenet_v2":
+            self.encoder = models.mobilenet_v2(weights=weights)
+            feature_dim = 1280
+        elif backbone == "efficientnet_b0":
+            self.encoder = models.efficientnet_b0(weights=weights)
+            feature_dim = 1280
+        else:
+            raise ValueError(f"Unsupported backbone: {backbone}")
+
+        # Remove the final classification layer
+        if backbone.startswith("resnet"):
+            self.encoder = nn.Sequential(*list(self.encoder.children())[:-1])
+        elif backbone == "mobilenet_v2":
+            self.encoder.classifier = nn.Identity()
+        elif backbone.startswith("efficientnet"):
+            self.encoder.classifier = nn.Identity()
 
         # Freeze the encoder (We only train the head)
         for param in self.encoder.parameters():
             param.requires_grad = False
 
         # The Classification Head
-        # We use a simple MLP. Input is 1024 (CLIP RN50 embedding size).
+        # We use a simple MLP. Input depends on the backbone.
         # We do NOT use Sigmoid here. We output raw logits for stability.
         self.classifier = nn.Sequential(
-            nn.Linear(1024, 256),
+            nn.Flatten(),
+            nn.Linear(feature_dim, 256),
             nn.ReLU(),
             nn.Dropout(0.1),
             nn.Linear(256, 1)
         )
 
     def forward(self, images):
-        # 1. Pass image through frozen CLIP encoder
+        # 1. Pass image through frozen CNN encoder
         with torch.no_grad():
-            features = self.encoder.encode_image(images)
+            features = self.encoder(images)
 
-        # 2. Normalize features (CLIP outputs are typically normalized)
-        features = features.float()
+        # 2. Ensure features are flattened
+        if len(features.shape) == 4:
+            features = features.squeeze(-1).squeeze(-1)
 
         # 3. Pass through classifier
         logits = self.classifier(features)
@@ -45,7 +74,7 @@ class JailbreakDetector(nn.Module):
 
 # --- DATASET ---
 class PairedDataset(Dataset):
-    def __init__(self, clean_dir, adv_dir, preprocess):
+    def __init__(self, clean_dir, adv_dir, transform):
         # Check if directories exist
         if not os.path.exists(clean_dir):
             raise ValueError(f"Clean directory does not exist: {clean_dir}")
@@ -66,7 +95,7 @@ class PairedDataset(Dataset):
             self.adv_files.extend(glob.glob(os.path.join(adv_dir, ext.upper())))
         self.adv_files = sorted(self.adv_files)
 
-        self.preprocess = preprocess
+        self.transform = transform
 
         # Create dataset list
         self.data = []
@@ -86,8 +115,8 @@ class PairedDataset(Dataset):
         path, label = self.data[idx]
         try:
             image = Image.open(path).convert("RGB")
-            # Preprocess (Resize/Normalize) using OpenCLIP preprocessing
-            image_tensor = self.preprocess(image)
+            # Apply transforms (Resize/Normalize) using torchvision
+            image_tensor = self.transform(image)
             return {
                 "pixel_values": image_tensor,
                 "labels": torch.tensor(label, dtype=torch.float)
@@ -104,18 +133,25 @@ def main():
     parser.add_argument("--adv_dir", required=True)
     parser.add_argument("--epochs", type=int, default=5)
     parser.add_argument("--batch_size", type=int, default=32)
+    parser.add_argument("--backbone", type=str, default="resnet18",
+                        choices=["resnet18", "resnet34", "resnet50", "mobilenet_v2", "efficientnet_b0"],
+                        help="CNN backbone architecture")
     args = parser.parse_args()
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f">>> Device: {device}")
 
-    # Load Preprocessing transforms for RN50
-    # This downloads and sets up the preprocessing pipeline
-    _, _, preprocess = open_clip.create_model_and_transforms('RN50', pretrained='openai')
+    # ImageNet normalization (standard for pretrained models)
+    transform = transforms.Compose([
+        transforms.Resize(224),
+        transforms.CenterCrop(224),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+    ])
 
     # Load Data
-    full_dataset = PairedDataset(args.clean_dir, args.adv_dir, preprocess)
-    
+    full_dataset = PairedDataset(args.clean_dir, args.adv_dir, transform)
+
     # Check if dataset is empty
     if len(full_dataset) == 0:
         raise ValueError(
@@ -124,18 +160,18 @@ def main():
             f"  Adversarial dir: {args.adv_dir}\n"
             f"  Found {len(full_dataset.clean_files)} clean files and {len(full_dataset.adv_files)} adversarial files"
         )
-    
+
     # Split 80/20
     train_size = int(0.8 * len(full_dataset))
     test_size = len(full_dataset) - train_size
     train_dataset, test_dataset = random_split(full_dataset, [train_size, test_size])
-    
+
     train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=4)
     test_loader = DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False, num_workers=4)
 
     # Initialize Model
-    model = JailbreakDetector().to(device)
-    
+    model = JailbreakDetectorCNN(backbone=args.backbone).to(device)
+
     # Optimizer & Loss
     optimizer = optim.Adam(model.classifier.parameters(), lr=1e-3)
     # BCEWithLogitsLoss includes the Sigmoid + BCELoss in one stable function
@@ -143,33 +179,42 @@ def main():
 
     print(">>> Starting Training...")
 
+    # Track metrics for plotting
+    metrics_history = {
+        "train_loss": [],
+        "train_acc": [],
+        "test_acc": []
+    }
+
     for epoch in range(args.epochs):
         model.train()
         train_loss = 0
         correct = 0
         total = 0
-        
+
         pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}")
         for batch in pbar:
             imgs = batch["pixel_values"].to(device)
             labels = batch["labels"].to(device).unsqueeze(1)
-            
+
             optimizer.zero_grad()
             logits = model(imgs)
             loss = criterion(logits, labels)
             loss.backward()
             optimizer.step()
-            
+
             train_loss += loss.item()
-            
+
             # Accuracy Calculation (Sigmoid > 0.5 is equivalent to Logits > 0)
-            preds = (logits > 0).float() 
+            preds = (logits > 0).float()
             correct += (preds == labels).sum().item()
             total += labels.size(0)
-            
+
             pbar.set_postfix({"Loss": loss.item()})
 
-        print(f"Train Loss: {train_loss/len(train_loader):.4f} | Train Acc: {100*correct/total:.2f}%")
+        avg_train_loss = train_loss/len(train_loader)
+        train_accuracy = 100*correct/total
+        print(f"Train Loss: {avg_train_loss:.4f} | Train Acc: {train_accuracy:.2f}%")
 
         # Evaluate
         model.eval()
@@ -179,18 +224,31 @@ def main():
             for batch in test_loader:
                 imgs = batch["pixel_values"].to(device)
                 labels = batch["labels"].to(device).unsqueeze(1)
-                
+
                 logits = model(imgs)
                 preds = (logits > 0).float()
-                
+
                 test_correct += (preds == labels).sum().item()
                 test_total += labels.size(0)
-        
-        print(f"TEST ACCURACY: {100*test_correct/test_total:.2f}%")
 
-    # Save
-    torch.save(model.state_dict(), "jailbreak_detector.pth")
-    print(">>> Detector Saved.")
+        test_accuracy = 100*test_correct/test_total
+        print(f"TEST ACCURACY: {test_accuracy:.2f}%")
+
+        # Save metrics
+        metrics_history["train_loss"].append(avg_train_loss)
+        metrics_history["train_acc"].append(train_accuracy)
+        metrics_history["test_acc"].append(test_accuracy)
+
+    # Save model
+    save_path = f"jailbreak_detector_{args.backbone}.pth"
+    torch.save(model.state_dict(), save_path)
+    print(f">>> Detector Saved to {save_path}")
+
+    # Save metrics
+    metrics_path = f"training_metrics_{args.backbone}.json"
+    with open(metrics_path, 'w') as f:
+        json.dump(metrics_history, f, indent=2)
+    print(f">>> Training metrics saved to {metrics_path}")
 
 if __name__ == "__main__":
     main()
