@@ -328,18 +328,6 @@ Adversarial Probability
 - Results inform defensive mechanisms and model hardening
 - Follow institutional ethics guidelines for AI red-teaming
 
-## Citation
-
-If you use this code or methodology in your research, please cite:
-
-```bibtex
-@misc{moleai2024,
-  title={MoleAI: Adversarial Attacks and Detection for Vision-Language Models},
-  author={[Your Names]},
-  year={2024},
-  note={Research project on VLM robustness}
-}
-```
 
 ## Acknowledgments
 
